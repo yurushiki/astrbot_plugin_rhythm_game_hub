@@ -28,13 +28,8 @@ def fmt_user(nickname: str, uid: str) -> str:
 
 
 def fmt_time(ts: float) -> str:
-    # 年两位 + HH:MM:SS（用于 /上机 /计时 /下机 /暂停）
+    # 年两位 + HH:MM:SS（冒号格式；不带中文单位）
     return datetime.fromtimestamp(ts).strftime("%y/%m/%d %H:%M:%S")
-
-
-def fmt_time_cn_hms(ts: float) -> str:
-    # 年两位 + HH小时MM分钟SS秒（用于 /窝几）
-    return datetime.fromtimestamp(ts).strftime("%y/%m/%d %H小时%M分钟%S秒")
 
 
 def fmt_hms_cn(seconds: float) -> str:
@@ -229,12 +224,14 @@ class ArcadeManager:
             u.active_machine = machine_id
             u.start_ts = now
 
+        # /上机：机器行与时间行分开
         return (
             f"用户{fmt_user(nickname, uid)}\n"
-            f"{machine_id}上机计费开始,当前时间为{fmt_time(now)}"
+            f"{machine_id}上机计费开始\n"
+            f"当前时间为{fmt_time(now)}"
         )
 
-    # ---------- 暂停（冻结当前段；不清零） ----------
+    # ---------- 暂停（冻结当前段；不清零；时间不带中文单位） ----------
     def pause(self, gid: str, uid: str, nickname: str) -> str:
         g = self._g(gid)
         u = self._u(g, uid, nickname)
@@ -263,6 +260,7 @@ class ArcadeManager:
             f"当前时间为{fmt_time(now)}",
         ]
 
+        # “您的总上机时长为”只出现一次
         if played:
             lines.append("您的总上机时长为：")
             for m in played:
@@ -322,7 +320,7 @@ class ArcadeManager:
             f"结账后请截图并发在本群内，感谢支持！"
         )
 
-    # ---------- 窝几（统计进店人数） ----------
+    # ---------- 窝几（统计进店人数；上机时间为冒号格式，无中文单位） ----------
     def wojis(self, gid: str) -> str:
         g = self._g(gid)
 
@@ -341,7 +339,7 @@ class ArcadeManager:
             lines.append(f"用户{fmt_user(nick, uid)}")
 
             if u and u.first_on_ts is not None:
-                lines.append(f"上机时间：{fmt_time_cn_hms(u.first_on_ts)}")
+                lines.append(f"上机时间：{fmt_time(u.first_on_ts)}")
             else:
                 lines.append("上机时间：未上机")
 
@@ -354,7 +352,7 @@ class ArcadeManager:
 # 插件入口（含落盘）
 # ======================
 
-@register("arcade", "YourName", "音游窝进店/离店/上机/暂停/计时/下机/窝几（三机）", "1.8.1")
+@register("arcade", "YourName", "音游窝进店/离店/上机/暂停/计时/下机/窝几（三机）", "1.8.3")
 class ArcadePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -475,7 +473,6 @@ class ArcadePlugin(Star):
         gid = str(event.get_group_id())
         uid = str(event.get_sender_id())
 
-        # 未进店不能用其它命令
         if not self.mgr.ensure_in_store(gid, uid):
             yield event.plain_result("您当前未在店内")
             return
