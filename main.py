@@ -6,7 +6,7 @@ import time
 import os
 import json
 import asyncio
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 from decimal import Decimal, ROUND_DOWN
 
@@ -103,7 +103,7 @@ class UserRuntime:
 
 class GroupState:
     def __init__(self):
-        self.in_store: Dict[str, dict] = {}          # uid -> {"nickname": str, "enter_ts": float}
+        # 不再维护 in_store
         self.users: Dict[str, UserRuntime] = {}      # uid -> UserRuntime
 
 
@@ -132,7 +132,6 @@ class ArcadeManager:
         out = {}
         for gid, g in self.groups.items():
             out[gid] = {
-                "in_store": g.in_store,
                 "users": {
                     uid: {
                         "uid": u.uid,
@@ -154,16 +153,6 @@ class ArcadeManager:
 
         for gid, raw in data.items():
             gs = GroupState()
-
-            store = (raw or {}).get("in_store", {}) or {}
-            if isinstance(store, dict):
-                for uid, v in store.items():
-                    try:
-                        nick = str((v or {}).get("nickname", ""))
-                        enter_ts = float((v or {}).get("enter_ts", time.time()))
-                        gs.in_store[str(uid)] = {"nickname": nick, "enter_ts": enter_ts}
-                    except Exception:
-                        continue
 
             users = (raw or {}).get("users", {}) or {}
             if isinstance(users, dict):
@@ -205,23 +194,6 @@ class ArcadeManager:
                         continue
 
             self.groups[str(gid)] = gs
-
-    # ---------- 进店 / 离店 ----------
-    def enter_store(self, gid: str, uid: str, nickname: str) -> str:
-        g = self._g(gid)
-        g.in_store[uid] = {"nickname": nickname, "enter_ts": time.time()}
-        self._u(g, uid, nickname)
-        return f"用户{fmt_user(nickname, uid)}已进店。"
-
-    def leave_store(self, gid: str, uid: str, nickname: str) -> str:
-        g = self._g(gid)
-        # 离店只影响在店名单（/窝几），不触碰计费与计时状态
-        self._u(g, uid, nickname)
-        g.in_store.pop(uid, None)
-        return f"用户{fmt_user(nickname, uid)}离开了"
-
-    def ensure_in_store(self, gid: str, uid: str) -> bool:
-        return uid in self._g(gid).in_store
 
     # ---------- 将某段时间按“自然日”切分并累加到 daily_totals ----------
     def _add_interval(self, u: UserRuntime, machine: str, start_ts: float, end_ts: float) -> None:
@@ -391,28 +363,33 @@ class ArcadeManager:
             f"结账后请截图并发在本群内，感谢支持！"
         )
 
-    # ---------- 窝几（统计进店人数；上机时间冒号格式） ----------
+    # ---------- 窝几（直接根据用户记录判断“在店/在机”） ----------
     def wojis(self, gid: str) -> str:
         g = self._g(gid)
 
+        # present 用户：有 active 或有 first_on_ts 或 daily_totals 非空
+        present = []
+        for uid, u in g.users.items():
+            has_daily = any(
+                (float(mobj.get(m, 0.0)) > 0.0) for dkey, mobj in u.daily_totals.items() for m in MACHINES
+            ) if u.daily_totals else False
+            if u.active_machine or u.first_on_ts is not None or has_daily:
+                present.append((uid, u))
+
         lines = [
-            f"当前在线人数：{len(g.in_store)}",
+            f"当前在线人数：{len(present)}",
             "在店人数有：",
         ]
 
-        sorted_items = sorted(g.in_store.items(), key=lambda kv: float((kv[1] or {}).get("enter_ts", 0.0)))
+        # 按 first_on_ts 排序（没有则放后）
+        present_sorted = sorted(present, key=lambda it: float(it[1].first_on_ts or 1e18))
 
-        for uid, info in sorted_items:
-            nick = str((info or {}).get("nickname", ""))
-            u = g.users.get(uid)
-
-            lines.append(f"用户{fmt_user(nick, uid)}")
-
-            if u and u.first_on_ts is not None:
+        for uid, u in present_sorted:
+            lines.append(f"用户{fmt_user(u.nickname, uid)}")
+            if u.first_on_ts is not None:
                 lines.append(f"上机时间：{fmt_time(u.first_on_ts)}")
             else:
                 lines.append("上机时间：未上机")
-
             lines.append("---")
 
         return "\n".join(lines)
@@ -422,7 +399,7 @@ class ArcadeManager:
 # 插件入口（含落盘）
 # ======================
 
-@register("arcade", "YourName", "音游窝进店/离店/上机/暂停/计时/下机/窝几（三机，按天封顶）", "1.9.0")
+@register("arcade", "YourName", "音游窝上机/暂停/计时/下机/窝几（三机，按天封顶；不需进店）", "1.10.0")
 class ArcadePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -459,35 +436,12 @@ class ArcadePlugin(Star):
             except Exception as e:
                 logger.error(f"save_state failed: {e}")
 
-    @filter.command("进店")
-    async def cmd_enter(self, event: AstrMessageEvent):
-        gid = str(event.get_group_id())
-        uid = str(event.get_sender_id())
-        name = event.get_sender_name()
-
-        msg = self.mgr.enter_store(gid, uid, name)
-        await self._save_state()
-        yield event.plain_result(msg)
-
-    @filter.command("离店")
-    async def cmd_leave(self, event: AstrMessageEvent):
-        gid = str(event.get_group_id())
-        uid = str(event.get_sender_id())
-        name = event.get_sender_name()
-
-        msg = self.mgr.leave_store(gid, uid, name)
-        await self._save_state()
-        yield event.plain_result(msg)
-
+    # /上机（不再需要先 /进店）
     @filter.command("上机")
     async def cmd_on(self, event: AstrMessageEvent):
         gid = str(event.get_group_id())
         uid = str(event.get_sender_id())
         name = event.get_sender_name()
-
-        if not self.mgr.ensure_in_store(gid, uid):
-            yield event.plain_result("您当前未在店内")
-            return
 
         machine_id = parse_machine_arg(event.message_str, "上机")
         if machine_id is None:
@@ -498,48 +452,39 @@ class ArcadePlugin(Star):
         await self._save_state()
         yield event.plain_result(msg)
 
+    # /暂停（不再需要先 /进店）
     @filter.command("暂停")
     async def cmd_pause(self, event: AstrMessageEvent):
         gid = str(event.get_group_id())
         uid = str(event.get_sender_id())
         name = event.get_sender_name()
 
-        if not self.mgr.ensure_in_store(gid, uid):
-            yield event.plain_result("您当前未在店内")
-            return
-
         msg = self.mgr.pause(gid, uid, name)
         await self._save_state()
         yield event.plain_result(msg)
 
+    # /计时（不再需要先 /进店）
     @filter.command("计时")
     async def cmd_timing(self, event: AstrMessageEvent):
         gid = str(event.get_group_id())
         uid = str(event.get_sender_id())
         name = event.get_sender_name()
 
-        if not self.mgr.ensure_in_store(gid, uid):
-            yield event.plain_result("您当前未在店内")
-            return
-
         yield event.plain_result(self.mgr.timing(gid, uid, name))
 
+    # /下机（不再需要先 /进店）
     @filter.command("下机")
     async def cmd_off(self, event: AstrMessageEvent):
         gid = str(event.get_group_id())
         uid = str(event.get_sender_id())
         name = event.get_sender_name()
 
-        if not self.mgr.ensure_in_store(gid, uid):
-            yield event.plain_result("您当前未在店内")
-            return
-
         msg = self.mgr.off_machine(gid, uid, name)
         await self._save_state()
         yield event.plain_result(msg)
 
+    # /窝几（任何人均可查询；显示当前“有记录/在机”的用户）
     @filter.command("窝几")
     async def cmd_wojis(self, event: AstrMessageEvent):
         gid = str(event.get_group_id())
-        # 修改点：/窝几 不需要进店也可查询
         yield event.plain_result(self.mgr.wojis(gid))
