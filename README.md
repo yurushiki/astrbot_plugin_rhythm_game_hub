@@ -1,4 +1,4 @@
-# helloworld
+# 含有大量ai生成内容
 
 AstrBot 插件模板
 
